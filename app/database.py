@@ -226,22 +226,11 @@ CREATE TABLE IF NOT EXISTS compute_templates (
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
     max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds > 0),
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    estimated_machine_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_machine_seconds >= 0),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS compute_quotas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject_type TEXT NOT NULL CHECK(subject_type IN ('user','role','project')),
-    subject_key TEXT NOT NULL,
-    max_queued INTEGER NOT NULL CHECK(max_queued >= 0),
-    max_running INTEGER NOT NULL CHECK(max_running >= 0),
-    daily_submissions INTEGER NOT NULL CHECK(daily_submissions >= 0),
-    updated_by TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(subject_type, subject_key)
 );
 CREATE TABLE IF NOT EXISTS compute_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,6 +250,9 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    estimated_machine_seconds INTEGER NOT NULL DEFAULT 0 CHECK(estimated_machine_seconds >= 0),
+    blocked_at TEXT NOT NULL DEFAULT '',
+    block_reason TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -293,6 +285,77 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_key TEXT NOT NULL UNIQUE,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_budget_pools (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_key TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('course','project','user')),
+    subject_key TEXT NOT NULL,
+    machine_quota INTEGER NOT NULL CHECK(machine_quota >= 0),
+    task_quota INTEGER NOT NULL CHECK(task_quota >= 0),
+    created_by TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(period_key, subject_type, subject_key)
+);
+CREATE TABLE IF NOT EXISTS compute_budget_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id INTEGER NOT NULL REFERENCES compute_budget_pools(id) ON DELETE CASCADE,
+    machine_delta INTEGER NOT NULL,
+    task_delta INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_adjustments_pool ON compute_budget_adjustments(pool_id,id);
+CREATE TABLE IF NOT EXISTS compute_resource_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id INTEGER NOT NULL REFERENCES compute_budget_pools(id) ON DELETE CASCADE,
+    period_key TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    machine_seconds INTEGER NOT NULL CHECK(machine_seconds > 0),
+    task_units INTEGER NOT NULL DEFAULT 1 CHECK(task_units > 0),
+    state TEXT NOT NULL CHECK(state IN ('reserved','settled','released')),
+    final_machine_seconds INTEGER,
+    final_task_units INTEGER,
+    settled_at TEXT NOT NULL DEFAULT '',
+    released_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(pool_id, task_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_resource_entries_pool ON compute_resource_entries(period_key,subject_type,subject_key,state);
+CREATE TABLE IF NOT EXISTS compute_resource_denials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id INTEGER NOT NULL REFERENCES compute_budget_pools(id) ON DELETE CASCADE,
+    period_key TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    required_machine_seconds INTEGER NOT NULL,
+    required_tasks INTEGER NOT NULL,
+    available_machine_seconds INTEGER NOT NULL,
+    available_tasks INTEGER NOT NULL,
+    resolution TEXT NOT NULL DEFAULT '',
+    first_denied_at TEXT NOT NULL,
+    last_denied_at TEXT NOT NULL,
+    resolved_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(pool_id, task_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_resource_denials_pool ON compute_resource_denials(period_key,subject_type,subject_key,resolved_at);
 '''
 
 PERMISSIONS = [
@@ -359,10 +422,23 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, declaration in columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(connection, "compute_templates", {"estimated_machine_seconds": "INTEGER NOT NULL DEFAULT 0 CHECK(estimated_machine_seconds >= 0)"})
+        _ensure_columns(connection, "compute_tasks", {
+            "estimated_machine_seconds": "INTEGER NOT NULL DEFAULT 0 CHECK(estimated_machine_seconds >= 0)",
+            "blocked_at": "TEXT NOT NULL DEFAULT ''",
+            "block_reason": "TEXT NOT NULL DEFAULT ''",
+        })
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

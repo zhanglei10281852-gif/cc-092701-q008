@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -13,14 +14,28 @@ class TemplateCreate(BaseModel):
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
     max_attempts: int = Field(default=3, ge=1, le=20)
+    estimated_machine_seconds: int = Field(default=600, ge=1, le=86400, description="每次执行预计占用的机器时（秒）")
 
 
-class QuotaSet(BaseModel):
-    subject_type: Literal["user", "role", "project"]
+class PeriodRegister(BaseModel):
+    period_key: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
+    starts_at: datetime
+    ends_at: datetime
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "PeriodRegister":
+        if self.ends_at <= self.starts_at:
+            raise ValueError("周期结束时间必须晚于开始时间")
+        return self
+
+
+class BudgetSet(BaseModel):
+    period_key: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
+    subject_type: Literal["course", "project", "user"]
     subject_key: str = Field(min_length=1, max_length=120)
-    max_queued: int = Field(default=20, ge=0, le=100000)
-    max_running: int = Field(default=4, ge=0, le=10000)
-    daily_submissions: int = Field(default=200, ge=0, le=1000000)
+    machine_seconds_quota: int = Field(ge=0, le=10**9, description="周期内可用机器时（秒）")
+    task_quota: int = Field(ge=0, le=10**7, description="周期内可结算任务数")
+    reason: str = Field(min_length=2, max_length=1000, description="设置或临时加额的理由，必填")
 
 
 class TaskSubmit(BaseModel):
@@ -41,7 +56,10 @@ class TaskClaim(BaseModel):
 class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     result: dict[str, Any]
-    metrics: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(
+        default_factory=dict,
+        description='可携带实际机器时（秒），键名 machine_seconds；缺省时按预计值结算',
+    )
 
 
 class TaskFailure(BaseModel):

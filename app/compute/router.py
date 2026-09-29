@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import (
+    BatchOperation,
+    BudgetSet,
+    CancelRequest,
+    PeriodRegister,
+    PriorityRequest,
+    RetryRequest,
+    TaskClaim,
+    TaskFailure,
+    TaskResult,
+    TaskSubmit,
+    TemplateCreate,
+)
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -22,9 +34,33 @@ def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=
     return service().create_template(payload.model_dump(), actor)
 
 
-@router.put("/quotas")
-def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
-    return service().set_quota(payload.model_dump(), actor)
+@router.post("/periods", status_code=201)
+def register_period(payload: PeriodRegister, actor: str = Query(..., min_length=1)):
+    return service().register_period(payload.model_dump(), actor)
+
+
+@router.get("/periods")
+def list_periods():
+    return {"items": service().list_periods()}
+
+
+@router.put("/budgets")
+def set_budget(payload: BudgetSet, actor: str = Query(..., min_length=1)):
+    return service().set_budget(payload.model_dump(), actor)
+
+
+@router.get("/budgets")
+def list_budgets(period_key: str | None = Query(default=None, min_length=2, max_length=64)):
+    return {"items": service().list_budgets(period_key)}
+
+
+@router.get("/resource-denials")
+def list_denials(
+    period_key: str | None = Query(default=None, min_length=2, max_length=64),
+    task_id: int | None = None,
+    include_resolved: bool = True,
+):
+    return {"items": service().list_denials(period_key=period_key, task_id=task_id, include_resolved=include_resolved)}
 
 
 @router.post("/tasks", status_code=202)
@@ -88,5 +124,5 @@ def recover_expired(actor: str = Query(default="recovery-worker", min_length=1))
 
 
 @router.get("/summary")
-def summary():
-    return service().summary()
+def summary(period_key: str | None = Query(default=None, min_length=2, max_length=64)):
+    return service().summary(period_key)
