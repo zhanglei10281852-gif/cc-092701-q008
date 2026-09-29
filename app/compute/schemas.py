@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -30,6 +31,39 @@ class TaskSubmit(BaseModel):
     parameters: dict[str, Any]
     priority: int = Field(default=50, ge=0, le=100)
     idempotency_key: str = Field(min_length=6, max_length=160)
+    period_key: str | None = Field(default=None, min_length=1, max_length=64)
+    course_code: str = Field(default="", max_length=80)
+    class_code: str = Field(default="", max_length=80)
+
+
+class PeriodCreate(BaseModel):
+    period_key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    name: str = Field(min_length=1, max_length=120)
+    starts_at: datetime
+    ends_at: datetime
+
+
+class BudgetSet(BaseModel):
+    period_key: str | None = Field(default=None, min_length=1, max_length=64)
+    scope_type: Literal["course", "class"]
+    scope_key: str = Field(min_length=1, max_length=80)
+    machine_seconds_limit: int = Field(ge=0, le=10**12)
+    tasks_limit: int = Field(ge=0, le=10**9)
+    reason: str = Field(default="初始额度", min_length=2, max_length=1000)
+
+
+class BudgetAdjust(BaseModel):
+    period_key: str | None = Field(default=None, min_length=1, max_length=64)
+    scope_type: Literal["course", "class"]
+    scope_key: str = Field(min_length=1, max_length=80)
+    delta_machine_seconds: int = Field(ge=-(10**12), le=10**12)
+    delta_tasks: int = Field(ge=-(10**9), le=10**9)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class BlockedApproval(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
 
 
 class TaskClaim(BaseModel):

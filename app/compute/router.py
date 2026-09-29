@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, BlockedApproval, BudgetAdjust, BudgetSet, CancelRequest, PeriodCreate, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -25,6 +25,51 @@ def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=
 @router.put("/quotas")
 def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
     return service().set_quota(payload.model_dump(), actor)
+
+
+@router.post("/periods", status_code=201)
+def create_period(payload: PeriodCreate, actor: str = Query(..., min_length=1)):
+    return service().create_period(payload.model_dump(), actor)
+
+
+@router.get("/periods")
+def list_periods():
+    return {"items": service().list_periods()}
+
+
+@router.post("/periods/{period_key}/close", status_code=200)
+def close_period(period_key: str, actor: str = Query(..., min_length=1)):
+    return service().close_period(period_key, actor)
+
+
+@router.put("/budgets")
+def set_budget(payload: BudgetSet, actor: str = Query(..., min_length=1)):
+    return service().set_budget(payload.model_dump(), actor)
+
+
+@router.post("/budgets/adjust")
+def adjust_budget(payload: BudgetAdjust, actor: str = Query(..., min_length=1)):
+    return service().adjust_budget(payload.model_dump(), actor)
+
+
+@router.get("/budgets")
+def list_budgets(period_key: str | None = None):
+    return {"items": service().list_budgets(period_key)}
+
+
+@router.get("/budgets/adjustments")
+def budget_adjustments(period_key: str, scope_type: str, scope_key: str):
+    return {"items": service().list_budget_adjustments(period_key, scope_type, scope_key)}
+
+
+@router.get("/blocked-tasks")
+def list_blocked_tasks(period_key: str | None = None, scope_type: str | None = None, scope_key: str | None = None):
+    return {"items": service().list_blocked_tasks(period_key, scope_type, scope_key)}
+
+
+@router.post("/tasks/{task_id}/approve-budget")
+def approve_blocked_task(task_id: int, payload: BlockedApproval):
+    return service().approve_blocked_task(task_id, payload.actor, payload.reason)
 
 
 @router.post("/tasks", status_code=202)
@@ -90,3 +135,8 @@ def recover_expired(actor: str = Query(default="recovery-worker", min_length=1))
 @router.get("/summary")
 def summary():
     return service().summary()
+
+
+@router.get("/budget-summary")
+def budget_summary(period_key: str | None = None, scope_type: str | None = None, scope_key: str | None = None):
+    return service().budget_summary(period_key, scope_type, scope_key)

@@ -12,7 +12,39 @@ from app.core.clock import to_storage, utc_now
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "township.db"
 _local = threading.local()
 
-SCHEMA = r''' 
+_COMPUTE_TASKS_TABLE_DDL = '''
+CREATE TABLE compute_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
+    project_code TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    parameter_digest TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','blocked_budget')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    current_result_version INTEGER,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    period_key TEXT NOT NULL DEFAULT 'default',
+    course_code TEXT NOT NULL DEFAULT '',
+    class_code TEXT NOT NULL DEFAULT '',
+    blocked_reason_json TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key)
+)
+'''
+
+SCHEMA = r'''
 CREATE TABLE IF NOT EXISTS departments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -243,31 +275,58 @@ CREATE TABLE IF NOT EXISTS compute_quotas (
     updated_at TEXT NOT NULL,
     UNIQUE(subject_type, subject_key)
 );
-CREATE TABLE IF NOT EXISTS compute_tasks (
+CREATE TABLE IF NOT EXISTS compute_periods (
+    period_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_budgets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
-    project_code TEXT NOT NULL,
-    requested_by TEXT NOT NULL,
-    parameters_json TEXT NOT NULL,
-    parameter_digest TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
-    idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
-    available_at TEXT NOT NULL,
-    lease_owner TEXT NOT NULL DEFAULT '',
-    lease_expires_at TEXT NOT NULL DEFAULT '',
-    current_result_version INTEGER,
-    last_error_code TEXT NOT NULL DEFAULT '',
-    last_error_message TEXT NOT NULL DEFAULT '',
-    version INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT,
-    finished_at TEXT,
+    period_key TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('course','class')),
+    scope_key TEXT NOT NULL,
+    machine_seconds_limit INTEGER NOT NULL CHECK(machine_seconds_limit >= 0),
+    tasks_limit INTEGER NOT NULL CHECK(tasks_limit >= 0),
+    created_by TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(requested_by, idempotency_key)
+    UNIQUE(period_key, scope_type, scope_key)
 );
+CREATE TABLE IF NOT EXISTS compute_budget_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    budget_id INTEGER NOT NULL REFERENCES compute_budgets(id) ON DELETE RESTRICT,
+    delta_machine_seconds INTEGER NOT NULL,
+    delta_tasks INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_adjustments_budget ON compute_budget_adjustments(budget_id,id);
+CREATE TABLE IF NOT EXISTS compute_budget_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_key TEXT NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    task_id INTEGER REFERENCES compute_tasks(id) ON DELETE SET NULL,
+    attempt_no INTEGER NOT NULL DEFAULT 0,
+    event_type TEXT NOT NULL CHECK(event_type IN ('reserve','release','settle','reject')),
+    reserve_id INTEGER,
+    machine_seconds INTEGER NOT NULL DEFAULT 0,
+    tasks_amount INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_ledger_scope ON compute_budget_ledger(period_key,scope_type,scope_key,id);
+CREATE INDEX IF NOT EXISTS idx_budget_ledger_task ON compute_budget_ledger(task_id,id);
+CREATE INDEX IF NOT EXISTS idx_budget_ledger_reserve ON compute_budget_ledger(reserve_id);
+__COMPUTE_TASKS_DDL__
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
 CREATE TABLE IF NOT EXISTS compute_results (
@@ -359,10 +418,56 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_compute_schema(connection: sqlite3.Connection, now: str) -> None:
+    """为早于周期/额度账本版本的数据库补齐列、约束与默认数据（幂等）。"""
+    table_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='compute_tasks'").fetchone()
+    if table_sql is not None and "blocked_budget" not in (table_sql[0] or ""):
+        # 旧表 status CHECK 不含 blocked_budget，SQLite 无法直接改约束：重建表后搬移数据。
+        connection.execute("ALTER TABLE compute_tasks RENAME TO compute_tasks_legacy")
+        connection.executescript(_COMPUTE_TASKS_TABLE_DDL)
+        legacy_columns = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks_legacy)").fetchall()}
+        period_column = "period_key" if "period_key" in legacy_columns else "'default'"
+        course_column = "course_code" if "course_code" in legacy_columns else "''"
+        class_column = "class_code" if "class_code" in legacy_columns else "''"
+        blocked_column = "blocked_reason_json" if "blocked_reason_json" in legacy_columns else "''"
+        connection.execute(
+            "INSERT INTO compute_tasks "
+            "(id,template_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,"
+            "status,attempt_count,max_attempts,available_at,lease_owner,lease_expires_at,current_result_version,"
+            "last_error_code,last_error_message,period_key,course_code,class_code,blocked_reason_json,version,"
+            "started_at,finished_at,created_at,updated_at) "
+            "SELECT id,template_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,"
+            "status,attempt_count,max_attempts,available_at,lease_owner,lease_expires_at,current_result_version,"
+            f"last_error_code,last_error_message,{period_column},{course_column},{class_column},{blocked_column},version,"
+            "started_at,finished_at,created_at,updated_at FROM compute_tasks_legacy"
+        )
+        connection.execute("DROP TABLE compute_tasks_legacy")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at)")
+    connection.execute(
+        "INSERT OR IGNORE INTO compute_periods(period_key,name,starts_at,ends_at,status,created_by,created_at,updated_at) VALUES('default','默认周期','1970-01-01T00:00:00+00:00','9999-12-31T23:59:59+00:00','open','system',?,?)",
+        (now, now),
+    )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
-    with transaction(immediate=True) as connection:
-        connection.executescript(SCHEMA)
+    connection = get_connection()
+    # 旧表重建需要 RENAME/DROP 父表，先在事务外关闭外键，避免级联清掉结果与账本历史。
+    foreign_keys_enabled = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        schema_sql = SCHEMA.replace(
+            "__COMPUTE_TASKS_DDL__",
+            _COMPUTE_TASKS_TABLE_DDL.replace("CREATE TABLE compute_tasks", "CREATE TABLE IF NOT EXISTS compute_tasks").strip() + ";"
+        )
+        with transaction(immediate=True) as tx_connection:
+            tx_connection.executescript(schema_sql)
+            _migrate_compute_schema(tx_connection, now)
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys=ON")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
